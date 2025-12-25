@@ -8,8 +8,8 @@ from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from screen import make_screens
-from word_grafik import make_grafik
+from rasterimage import make_screens
+from graph import make_grafik 
 
 PIC_W = Inches(6.5)
 FONT_NAME = "Times New Roman"
