@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 import os
 import json
 import tempfile
@@ -8,9 +8,11 @@ from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from rasterimage import make_screens
-from graph import make_grafik 
+from screen import make_screens
+from word_grafik import make_grafik
 
+
+# ====== CONFIG (лучше вынести в .env, но можно так) ======
 PIC_W = Inches(6.5)
 FONT_NAME = "Times New Roman"
 FONT_SIZE = 14
@@ -55,6 +57,13 @@ def _p_left(doc: Document, text: str):
         r.font.size = Pt(FONT_SIZE)
     return p
 
+def _p_justify(doc: Document, text: str):
+    p = doc.add_paragraph(text)
+    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY  # 🔹 по ширине
+    for r in p.runs:
+        r.font.name = FONT_NAME
+        r.font.size = Pt(FONT_SIZE)
+    return p
 
 def _add_picture_center(doc: Document, path: str, width=PIC_W):
     p = doc.add_paragraph()
@@ -65,7 +74,8 @@ def _add_picture_center(doc: Document, path: str, width=PIC_W):
 
 def _add_multiline(doc: Document, text: str):
     for part in [t.strip() for t in (text or "").split("\n\n") if t.strip()]:
-        _p_left(doc, part)
+        _p_justify(doc, part)   # ✅ только JSON — по ширине
+
 
 
 def build_docx(
@@ -80,8 +90,14 @@ def build_docx(
     text_json_path: str,
     out_docx: str,
 ):
+    """
+    Делает docx. Внутри генерит 3 PNG на газ:
+      1) mintaqa_screen (вся республика)
+      2) grafik
+      3) rayon_screen (регион + соседние)
+    """
 
-
+    # нормализуем вход
     gases = [g.strip().upper() for g in gases if str(g).strip()]
     if not gases:
         raise ValueError("gases is empty")
@@ -109,7 +125,7 @@ def build_docx(
                 date_str=date_str,
                 parent_cod=parent_cod,
                 rasters_root=rasters_root,
-                vector_path=mintaqa_shp,        
+                vector_path=mintaqa_shp,         # <-- один и тот же shp
                 base_vector_path=tuman_shp,
                 out_dir=tmpdir,
             )
@@ -120,13 +136,13 @@ def build_docx(
                 date_str=date_str,
                 parent_cod=parent_cod,
                 rasters_root=rasters_root,
-                mintaqa_shp=mintaqa_shp,       
+                mintaqa_shp=mintaqa_shp,         # <-- тот же shp
                 out_dir=tmpdir,
                 lookback_days=count_gase,
             )
             region_name = grafik.get("region_name") or str(parent_cod)
 
-
+            # ===== PAGE 1: республика png -> график =====
             _p_center_bold(
                 doc,
                 f"{idx}. Respublika va {region_name} kesimida {_uz_date(date_str)} holatiga ko‘ra "
@@ -141,7 +157,7 @@ def build_docx(
 
             doc.add_page_break()
 
-
+            # ===== PAGE 2: region png -> text =====
             _p_left(doc, f"{region_name} va unga yondosh hududlar:")
             _add_picture_center(doc, screens["rayon"])
 
@@ -155,3 +171,30 @@ def build_docx(
 
     return out_docx
 
+
+# ====== local test ======
+if __name__ == "__main__":
+    # входы для локального запуска
+    GASES = ["AERAI", "CH4", "CO", "HCHO","O3", "SO2", "NO2"]
+    # GASES = ["AERAI","CO",]
+    DATE = "2025-12-27"
+    PARENT_COD = 1726
+    COUNT_GASE = 7
+
+
+    RASTERS_ROOT = r"D:\Xalim\wind_visual\gaz\sentinel\data"
+    MINTAQA_SHP = r"D:\Xalim\documents\Mintaqa\Mintaqa.shp"
+    TUMAN_SHP = r"D:\Xalim\documents\Mintaqa\Tuman.shp"
+
+    TEXT_JSON_PATH = r"D:\Xalim\wind_visual\text.json"
+    OUT_DOCX = r"D:\Xalim\wind_visual\word\report12345.docx"
+
+    build_docx(
+        GASES, DATE, PARENT_COD, COUNT_GASE,
+        rasters_root=RASTERS_ROOT,
+        mintaqa_shp=MINTAQA_SHP,
+        tuman_shp=TUMAN_SHP,
+        text_json_path=TEXT_JSON_PATH,
+        out_docx=OUT_DOCX,
+    )
+    print("Saved:", OUT_DOCX)
