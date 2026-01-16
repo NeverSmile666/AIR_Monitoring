@@ -20,19 +20,22 @@ osr.UseExceptions()
 
 GAS_UNITS = {
     "CH4": "ppm",
-    "CO": "mol/km²",
+    "CO": "mol/m²",
     "NO2": "mol/km²",
     "SO2": "mol/km²",
     "HCHO": "mol/km²",
     "O3": "mol/m²",
-    "AERAI": "unitless",
+    "AERAI": "",
 }
 
 
 def _parse_date_from_filename(path: str) -> datetime:
     base = os.path.basename(path)
-    s = re.sub(r"\.tif{1,2}$", "", base, flags=re.IGNORECASE)
-    d = s.split("_")[-1]
+    m = re.search(r"(\d{4}-\d{2}-\d{2}|\d{8}|\d{2}-\d{2}-\d{4})", base)
+    if not m:
+        raise ValueError(f"Can't parse date from filename: {path}")
+
+    d = m.group(1)
     for fmt in ("%Y-%m-%d", "%Y%m%d", "%d-%m-%Y"):
         try:
             return datetime.strptime(d, fmt).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -119,10 +122,6 @@ def _compute_mean(gas: str, values: np.ndarray) -> float:
 
 
 def _dedupe_by_date(selected: List[Tuple[datetime, str]]) -> List[Tuple[datetime, str]]:
-    """
-    Убираем дубли по дате (если в папке несколько tif на одну дату).
-    Берём один путь на дату (последний по сортировке путей).
-    """
     by_day: Dict[datetime, str] = {}
     for dt, path in selected:
         day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -130,30 +129,89 @@ def _dedupe_by_date(selected: List[Tuple[datetime, str]]) -> List[Tuple[datetime
     return sorted(by_day.items(), key=lambda x: x[0])
 
 
+def _smooth_curve(dts: List[datetime], ys: np.ndarray, n_points: int = 400):
+    x = mdates.date2num(dts).astype(float)
+    y = ys.astype(float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    uniq_x, uniq_y = [], []
+    last = None
+    acc = []
+    for xi, yi in zip(x, y):
+        if last is None or xi == last:
+            acc.append(yi)
+            last = xi
+        else:
+            uniq_x.append(last)
+            uniq_y.append(float(np.mean(acc)))
+            acc = [yi]
+            last = xi
+    if last is not None:
+        uniq_x.append(last)
+        uniq_y.append(float(np.mean(acc)))
+
+    x = np.array(uniq_x, dtype=float)
+    y = np.array(uniq_y, dtype=float)
+
+    if x.size <= 1:
+        return x, y
+
+    x_new = np.linspace(x.min(), x.max(), int(max(50, n_points)))
+
+    # 1) try SciPy cubic spline (best)
+    try:
+        from scipy.interpolate import make_interp_spline  # type: ignore
+        if x.size >= 4:
+            spl = make_interp_spline(x, y, k=3)
+            y_new = spl(x_new)
+        elif x.size == 3:
+            spl = make_interp_spline(x, y, k=2)
+            y_new = spl(x_new)
+        else:
+            y_new = np.interp(x_new, x, y)
+        return x_new, y_new
+    except Exception:
+        pass
+
+    # 2) fallback: polynomial fit (safe-ish)
+    deg = 3 if x.size >= 4 else (2 if x.size == 3 else 1)
+    try:
+        coeff = np.polyfit(x, y, deg)
+        y_new = np.polyval(coeff, x_new)
+        return x_new, y_new
+    except Exception:
+        y_new = np.interp(x_new, x, y)
+        return x_new, y_new
+
+
 def _build_chart_png(gas: str, region_name: str, year: int, unit: str,
                      points: List[Tuple[datetime, float]], lookback_days: int) -> bytes:
-    x = [dt for dt, _ in points]
-    y = [v for _, v in points]
+    dts = [dt for dt, _ in points]
+    y = np.array([v for _, v in points], dtype=float)
+
+    x_s, y_s = _smooth_curve(dts, y, n_points=500)
 
     fig = plt.figure(figsize=(12, 5.5), dpi=170)
     ax = fig.add_subplot(111)
 
-    ax.plot(x, y, marker="o", linewidth=2)
+    ax.plot(mdates.num2date(x_s), y_s, linewidth=2.7)
+
     ax.set_title(f"{gas} — {region_name} {year}")
     ax.set_ylabel(f"Mean ({unit})")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.8)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m.%d"))
-
-    # ---- Тики по вашему правилу ----
     if lookback_days == 7:
-        # каждую дату (все точки)
-        ax.set_xticks(x)
+        ax.set_xticks(dts)
     elif lookback_days == 15:
-        # каждые 2 дня
         ax.xaxis.set_major_locator(mdates.DayLocator(interval=2))
     else:
-        # 30 (или другое) — как раньше: до ~15 подписей
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=15))
 
     fig.autofmt_xdate(rotation=0, ha="center")
@@ -169,14 +227,6 @@ def _build_chart_png(gas: str, region_name: str, year: int, unit: str,
 def make_grafik(gas: str, date_str: str, parent_cod: int,
                 rasters_root: str, mintaqa_shp: str, out_dir: str,
                 lookback_days: int = 30) -> dict:
-    """
-    Делает {gas}_{DATE}_grafik.png
-
-    lookback_days: 30 / 15 / 7
-      30 -> текущее поведение
-      15 -> подписи каждые 2 дня
-      7  -> подписи на каждую дату
-    """
     gas = gas.upper()
     os.makedirs(out_dir, exist_ok=True)
 
@@ -185,7 +235,6 @@ def make_grafik(gas: str, date_str: str, parent_cod: int,
 
     end_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=int(lookback_days) - 1)
-
     year = end_dt.year
 
     ds_vec, lyr = _open_layer(mintaqa_shp)
@@ -208,25 +257,20 @@ def make_grafik(gas: str, date_str: str, parent_cod: int,
             dt = _parse_date_from_filename(p)
         except ValueError:
             continue
-
-        if dt > end_dt:
+        if dt > end_dt or dt < start_dt:
             continue
-        if dt < start_dt:
-            continue
-
         selected.append((dt, p))
 
     if not selected:
         raise RuntimeError(f"Нет tif в диапазоне {start_dt:%Y-%m-%d}..{end_dt:%Y-%m-%d} для {gas}")
 
-    # FIX: убираем дубли по датам (иначе точки могут повторяться)
     selected = _dedupe_by_date(selected)
 
     points: List[Tuple[datetime, float]] = []
     for dt, tif_path in selected:
         da = rioxarray.open_rasterio(tif_path).squeeze()
         poly_geo = _geom_to_raster_geojson(geom, vec_srs, da.rio.crs)
-        clipped = da.rio.clip([poly_geo], drop=False)
+        clipped = da.rio.clip([poly_geo], drop=True)
         points.append((dt, _compute_mean(gas, clipped.values.flatten())))
 
     png_bytes = _build_chart_png(
